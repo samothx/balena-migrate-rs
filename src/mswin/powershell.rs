@@ -16,8 +16,10 @@ use log::{error, trace, warn};
 use regex::Regex;
 use std::collections::HashSet;
 use std::io::ErrorKind;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{Read,Write};
+use std::process::{Command, Stdio, Child};
+
+const OPT_INTERACTIVE: bool = true;
 
 struct PWRes {
     stdout: String,
@@ -27,6 +29,8 @@ struct PWRes {
 pub struct PSInfo {
     ps_ver: Option<(u32, u32)>,
     ps_cmdlets: HashSet<String>,
+    ps_child: Option<Child>,
+    ps_prompt: Option<String>,
     si_os_name: String,
     si_os_release: String,
     si_mem_tot: usize,
@@ -39,13 +43,20 @@ impl PSInfo {
         let mut ps_info = PSInfo {
             ps_ver: None,
             ps_cmdlets: HashSet::new(),
+            ps_child: None,  
+            ps_prompt: None,  
             si_os_name: String::new(),
             si_os_release: String::new(),
             si_mem_tot: 0,
             si_mem_avail: 0,
             si_boot_dev: String::new(),
+
         };
 
+        if OPT_INTERACTIVE {
+            ps_info.init_ps_child()?;
+        }
+        
         match ps_info.get_cmdlets() {
             Ok(_v) => (),
             Err(why) => return Err(why),
@@ -316,6 +327,152 @@ impl PSInfo {
 
         Ok(())
     }
+
+    fn init_ps_child(&mut self) -> Result<(),MigError> {
+        trace!("{}::init_ps_child: started", MODULE);
+        let mut child = match Command::new(POWERSHELL)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn() {
+            Ok(child) => child,
+            Err(why) => match why.kind() {
+                ErrorKind::NotFound => {
+                    return Err(MigError::from_code(
+                        MigErrorCode::ErrPgmNotFound,
+                        &format!("{}::init_ps_child: failed to execute: powershell Systeminfo /FO CSV",MODULE),
+                        Some(Box::new(why)),
+                        ))
+                }
+                _ => {
+                    return Err(MigError::from_code(
+                        MigErrorCode::ErrExecProcess,
+                        &format!("{}::init_ps_child: failed to execute: powershell Systeminfo /FO CSV",MODULE),
+                        Some(Box::new(why)),
+                    ))
+                }
+            },
+        };
+
+        let mut prompt = String::new();
+        match child.stdout {
+            Some(stdout) => match stdout.read_to_string(&mut prompt) {
+                Ok(n) => (),
+                Err(why) => {
+                    child.kill();
+                    return Err(MigError::from_code(
+                        MigErrorCode::ErrExecProcess,
+                        &format!("{}::init_ps_child: no stdout pipe found for intearctive powershell", MODULE),
+                        Some(Box::new(why))))
+                },
+            }
+            None => return Err(MigError::from_code(
+                        MigErrorCode::ErrExecProcess,
+                        &format!("{}::init_ps_child: no stdout pipe found for intearctive powershell", MODULE),
+                        None)),
+        };
+
+        self.ps_child = Some(child);
+        self.ps_prompt = Some(prompt);
+        trace!("{}::init_cmd: get prompt {}", MODULE, prompt);
+
+        Ok(())
+    }
+
+    fn exec_initeractive(child : &mut Child, args: &[&str]) {
+        child.kill();
+    }
+
+    fn call_ps(&mut self,args: &[&str], trim_stdout: bool) -> Result<PWRes, MigError> {
+        if OPT_INTERACTIVE {
+
+            if let Some(ref mut child) = self.ps_child {
+                PSInfo::exec_initeractive(child, args);
+            } else {
+                    trace!("{}::call_ps: starting child process", MODULE);
+                    self.init_ps_child()?;
+                    PSInfo::exec_initeractive(&mut self.ps_child.unwrap(),args);    
+            }          
+
+            //let &mut child = 
+            match self.ps_child {
+                Some(ref mut child) => child.kill(),
+                None => { 
+                }
+            };
+
+            match child.stdin {
+                Some(stdin) => {
+                    let mut command = String::new();
+                    for arg in args {
+                        command += arg;
+                        command.push(' ');
+                    }
+                    command.push('\n');
+                    stdin.write(command.as_bytes());                    
+                },
+                None => {
+                    child.kill();
+                    self.ps_child = None;
+                    return Err(MigError::from_code(
+                                    MigErrorCode::ErrExecProcess,
+                                    &format!("{}::call_ps: stdin not present for powershell interactive command",MODULE),
+                                    None))
+                },
+            };
+
+            let mut stdout_str = String::new();            
+            match child.stdout {
+                Some(mut stdout) => match stdout.read_to_string(&mut stdout_str) {
+                    Ok(n) => (),
+                    Err(why) => {
+                        child.kill();
+                        self.ps_child = None;
+                        return Err(MigError::from_code(
+                                    MigErrorCode::ErrExecProcess,
+                                    &format!("{}::call_ps: failed to read from powershell interactive command",MODULE),
+                                    Some(Box::new(why))))
+                    },
+                },
+                None => {
+                    child.kill();
+                    self.ps_child = None;
+                    return Err(MigError::from_code(
+                                    MigErrorCode::ErrExecProcess,
+                                    &format!("{}::call_ps: stdout not present for powershell interactive command",MODULE),
+                                    None))
+                }
+            }
+
+            let mut stderr_str = String::new();            
+            match child.stderr {
+                Some(mut stderr) => match stderr.read_to_string(&mut stderr_str) {
+                    Ok(n) => (),
+                    Err(why) => {
+                        child.kill();
+                        self.ps_child = None;
+                        return Err(MigError::from_code(
+                                    MigErrorCode::ErrExecProcess,
+                                    &format!("{}::call_ps: failed to read from powershell interactive command",MODULE),
+                                    Some(Box::new(why))))
+                    },
+                },
+                None => {
+                    child.kill();
+                    self.ps_child = None;
+                    return Err(MigError::from_code(
+                                    MigErrorCode::ErrExecProcess,
+                                    &format!("{}::call_ps: stdout not present for powershell interactive command",MODULE),
+                                    None))
+                }
+            }
+
+
+            Ok(PWRes{stdout: stdout_str, stderr: stderr_str})            
+        } else {
+            call_to_string(args,trim_stdout)
+        }
+    }   
 }
 
 impl SysInfo for PSInfo {
@@ -338,12 +495,15 @@ impl SysInfo for PSInfo {
     fn get_boot_dev(&self) -> String {
         self.si_boot_dev.clone()
     }
+
+
 }
 
 fn call_to_string(args: &[&str], trim_stdout: bool) -> Result<PWRes, MigError> {
     // TODO: add option - trim -
 
-    trace!("{}::call_to_string(): called with {:?}", MODULE, args);
+    trace!("{}::call_to_string(): called with {:?} interactive={}", MODULE, args, OPT_INTERACTIVE);
+
     let process = match Command::new(POWERSHELL)
         .args(args)
         .stdout(Stdio::piped())
@@ -373,6 +533,21 @@ fn call_to_string(args: &[&str], trim_stdout: bool) -> Result<PWRes, MigError> {
                 ));
             }
         },
+    };
+
+    match process.wait() {
+        Ok(s) => match s {
+            SUCCESS => (),
+            FAILURE => return Err(MigError::from_code(
+                MigErrorCode::ErrExecProcess,
+                &format!("{}::call_to_string: got non zero exit code {} waiting for powershell to terminate", MODULE, s),
+                None)),
+        },
+        Err(why) => return Err(MigError::from_code(
+            MigErrorCode::ErrExecProcess,
+            &format!("{}::call_to_string: got error waiting for powershell to terminate", MODULE),
+            Some(Box::new(why)))),
+
     };
 
     let mut stdout_str: String = String::from("");
